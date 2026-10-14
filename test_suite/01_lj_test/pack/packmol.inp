@@ -1,0 +1,15 @@
+tolerance 1.5
+filetype xyz
+output system_packed.xyz
+seed 678
+
+structure molecule_0.xyz
+  number 1
+  inside box 0 0 0 35.0 35.0 35.0
+end structure
+
+structure molecule_1.xyz
+  number 1000
+  inside box 0 0 0 35.0 35.0 35.0
+end structure
+

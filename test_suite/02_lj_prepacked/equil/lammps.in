@@ -1,0 +1,67 @@
+
+##############################################
+###              Variables               ###
+##############################################
+
+variable       T               equal      0.7
+variable       T_damp          equal      1.0
+variable       P               equal      1.0
+variable       P_damp          equal      2.5
+variable       seed            equal      3454
+
+##############################################
+###           General Settings             ###
+##############################################
+
+units           lj
+atom_style      full
+boundary        p p p
+kspace_style    none
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+##############################################
+###              Read Data                 ###
+##############################################
+
+read_data       packed.data
+velocity        all create ${T} ${seed} mom yes rot yes dist gaussian
+
+##############################################
+###           Model Definition             ###
+##############################################
+
+include         styles.lmp
+include         params.lmp
+
+special_bonds   lj/coul 0.0 0.0 1.0
+
+##############################################
+###       Dynamics / Minimization          ###
+##############################################
+
+fix             1 all npt temp ${T} ${T} ${T_damp} iso ${P} ${P} ${P_damp}
+thermo          100
+thermo_style    custom step temp etotal econserve ke pe ebond eangle edihed press density vol
+dump            1 all custom 1000 traj.lammpstrj id type xu yu zu
+dump_modify     1 sort id
+
+variable        xdim equal lx
+variable        ydim equal ly
+variable        zdim equal lz
+fix             boxlens all ave/time 1 12500 12500 v_xdim v_ydim v_zdim
+
+timestep        0.005
+run             25000
+
+variable        avg_xdim equal f_boxlens[1]
+variable        avg_ydim equal f_boxlens[2]
+variable        avg_zdim equal f_boxlens[3]
+
+change_box      all x final 0.0 ${avg_xdim} y final 0.0 ${avg_ydim} z final 0.0 ${avg_zdim} remap
+
+##############################################
+###            Save Datafile             ###
+##############################################
+
+write_data      equilibrated.data nocoeff

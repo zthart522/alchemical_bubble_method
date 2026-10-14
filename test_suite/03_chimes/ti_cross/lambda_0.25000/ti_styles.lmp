@@ -1,0 +1,3 @@
+pair_style hybrid/scaled $(1.0-v_lambda_cross) chimesFF &
+                         v_lambda_cross chimesFF &
+                         v_lambda_bubble soft 2.0

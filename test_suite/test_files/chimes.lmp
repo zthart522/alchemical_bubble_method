@@ -1,0 +1,2 @@
+pair_style chimesFF
+pair_coeff 1*2 1*2 /scratch/11346/zthart/fuse_project/scaling_test/params.txt

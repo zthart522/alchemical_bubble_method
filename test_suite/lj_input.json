@@ -1,0 +1,79 @@
+{
+    "random_seed_use": false,
+    "accelerator": null,
+    "executables":{
+        "lammps": "/work2/11346/zthart/stampede3/sw/new-fuse/lammps/build/lmp",
+        "packmol": "/work2/11346/zthart/stampede3/sw/bin/packmol"
+    },
+    "scheduler":{
+        "type": "local",
+        "user": "zthart",
+        "queue": "skx-dev",
+        "check_freq": 30,
+        "max_submit": 4
+    },
+    "job_details": {
+        "account": "TG-CHM250015",
+        "queue": "skx-dev",
+        "nodes": 1,
+        "tasks": 48,
+        "walltime": "00:05:00"
+    },
+    "ti_job_details":{
+        "min":{
+            "walltime": "00:05:00"
+        },
+        "equil":{
+            "walltime": "00:20:00"
+        },
+        "ti_elec":{
+            "walltime": "00:20:00"
+        },
+        "ti_vdw":{
+            "walltime": "00:20:00"
+        },
+        "ti_vacuum":{
+            "walltime": "00:20:00"
+        }
+    },
+    "input_templates": {
+        "scheduler": "./test_templates/local.sh",
+        "min": "./test_templates/min.in",
+        "equil": "./test_templates/equil.in",
+        "bubble_on": "./test_templates/bubble.in",
+        "bubble_off": "./test_templates/bubble.in",
+        "ti_cross": "./test_templates/bubble.in"
+    },
+    "sim_params":{
+        "units": "lj",
+        "temp": 0.7,
+        "press": 1.0,
+        "temp_damp": 1.0,
+        "press_damp": 2.5,
+        "timestep": 0.005,
+        "equil_steps": 25000,
+        "ti_steps": 25000
+    },
+    "system_params":{
+        "system_mode": "pack",
+        "pack_tol": 1.5,
+        "pack_boxlen": 35.0,
+        "style_file": "test_files/lj_style.lmp",
+        "param_file": "test_files/lj_param.lmp",
+        "solute": {
+            "structure": "test_files/lj.data"
+        },
+        "solvent": [
+            {
+                "structure": "test_files/lj.data",
+                "number": 1000
+            }
+        ]
+    },
+    "ti_params":{
+        "bubble_potential": "soft 1.05",
+        "bubble_param_args": "50.0",
+        "lambda_values": 21,
+        "equil_frac": 0.30
+    }
+}

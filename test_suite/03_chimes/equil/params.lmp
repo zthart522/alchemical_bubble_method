@@ -1,0 +1,7 @@
+pair_coeff 1 1 /scratch/11346/zthart/fuse_project/scaling_test/params.txt
+pair_coeff 1 2 /scratch/11346/zthart/fuse_project/scaling_test/params.txt
+pair_coeff 1 3 /scratch/11346/zthart/fuse_project/scaling_test/params.txt
+pair_coeff 2 2 /scratch/11346/zthart/fuse_project/scaling_test/params.txt
+pair_coeff 2 3 /scratch/11346/zthart/fuse_project/scaling_test/params.txt
+pair_coeff 3 3 /scratch/11346/zthart/fuse_project/scaling_test/params.txt
+

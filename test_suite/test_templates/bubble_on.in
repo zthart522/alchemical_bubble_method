@@ -1,0 +1,70 @@
+
+##############################################
+###              Variables                 ###
+##############################################
+
+variable       T               equal      {{ temp }}
+variable       T_damp          equal      {{ temp_damp }}
+variable       P               equal      {{ press }}
+variable       P_damp          equal      {{ press_damp }}
+variable       seed            equal      {{ random_seed }}
+
+variable       lambda_cross    equal      {{ lambda_cross }}
+variable       lambda_bubble   equal      "{{ lambda_bubble }}*(step < 50000)*(step/50000.0) + {{ lambda_bubble }}*(step >= 50000)"
+
+variable       iofrq           equal      100
+
+##############################################
+###           General Settings             ###
+##############################################
+
+units           {{ units }}
+atom_style      {{ atom_style }}
+boundary        p p p
+kspace_style    none
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+##############################################
+###              Read Data                 ###
+##############################################
+
+read_data       {{ data_infile }}
+
+##############################################
+###           Model Definition             ###
+##############################################
+
+include         {{ forcefield_styles }}
+include         {{ forcefield_params }}
+
+##############################################
+###                Groups                ###
+##############################################
+
+group           solute   {{ group_cmd }}
+group           solvent  subtract all solute
+
+##############################################
+###       Dynamics / Minimization        ###
+##############################################
+
+{{ dUdL_computation_block }}
+
+fix             1 all npt temp ${T} ${T} ${T_damp} iso ${P} ${P} ${P_damp}
+fix             dUdL_avg all ave/time 1 ${iofrq} ${iofrq} v_dUdL
+
+thermo          ${iofrq}
+thermo_style    custom step temp etotal econserve ke pe press density vol v_dUdL f_dUdL_avg
+
+dump            1 all custom  ${iofrq} traj.lammpstrj id type xu yu zu
+dump_modify     1 sort id
+
+timestep        {{ timestep }}
+run             {{ ti_steps + 50000 }}
+
+##############################################
+###            Save Datafile             ###
+##############################################
+
+write_data      {{ data_outfile }} nocoeff
