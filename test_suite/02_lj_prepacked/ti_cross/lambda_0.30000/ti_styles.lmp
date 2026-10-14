@@ -1,3 +1,0 @@
-pair_style hybrid/scaled $(1.0-v_lambda_cross) lj/cut 2.5 &
-                         v_lambda_cross lj/cut 2.5 &
-                         v_lambda_bubble soft 1.05

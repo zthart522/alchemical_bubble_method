@@ -1,7 +1,0 @@
-pair_coeff 1 1 lj/cut 1 1.0 1.0
-pair_coeff 1 2 lj/cut 1 1.0 1.0
-pair_coeff 2 2 lj/cut 1 1.0 1.0
-pair_coeff 1 1 lj/cut 2 1.0 1.0
-pair_coeff 2 2 lj/cut 2 1.0 1.0
-pair_coeff 1 2 soft 50.0
-
