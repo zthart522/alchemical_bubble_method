@@ -273,15 +273,32 @@ class Checkpointer:
     Minimal class for reading, writing checkpoint & logging
     """
 
-    def __init__(self, cp_file=None):
-        self.cp_file = cp_file if cp_file is not None else "checkpoint.json"
+    def __init__(self, path=None):
+        self.path = path if path is not None else "checkpoint.json"
+        self.data = {}
+        self.restart()
 
-    def write_checkpoint(self, checkpoint):
-        with open(self.cp_file, 'w') as f:
+    def write(self, checkpoint=None):
+        if checkpoint is None:
+            checkpoint = self.data
+        with open(self.path, 'w') as f:
             json.dump(checkpoint, f, indent=2)
 
-    def read_checkpoint(self):
-        if not os.path.isfile(self.cp_file):
+    def load(self):
+        if not os.path.isfile(self.path):
             return {}
-        with open(self.cp_file) as f:
+        with open(self.path) as f:
             return json.load(f)
+
+    def update(self, property, value):
+        self.data[property] = value
+        self.write()
+
+    def restart(self):
+        self.data = self.load()
+
+    def get(self, property, default=None):
+        val = self.data.get(property)
+        if val is None:
+            val = default
+        return val

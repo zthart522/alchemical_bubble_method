@@ -178,6 +178,7 @@ def make_job_fill(cfg, stage, lmp_exe, flags):
     """Build slurm fill dict: global job_details + scheduler + per-stage overrides."""
     fill = {k: v for k, v in cfg["job_details"].items() if v not in ("", None)}
     fill.setdefault("nodes", 1)
+    flags = "" if flags is None else flags
     fill["cmd"] = f'{lmp_exe} {flags} -in lammps.in | tee out.lammps'
     fill.update(cfg.get("ti_job_details", {}).get(stage, {}))
     return fill
@@ -260,6 +261,73 @@ LAMBDA_MAP = {
     "bubble_off": "lambda_bubble"
 }
 
+def prepare_ti_lambda(cfg, cp, leg, lam, root, template_fill):
+    
+    fill_copy = template_fill.copy()
+
+    if leg == "bubble_on":
+        fill_copy["lambda_cross"] = 0.0
+    elif leg == "ti_cross":
+        fill_copy["lambda_bubble"] = 1.0
+    elif leg == "bubble_off":
+        fill_copy["lambda_cross"] = 1.0
+    else:
+        raise ValueError(f"Unknown LEG: {leg}")
+
+    fill_copy[LAMBDA_MAP[leg]] = lam
+
+    fill_copy["dUdL_computation_block"] = build_compute_dUdL_lines(
+        f'{cp.get("ff_path")}/ti_styles.lmp',
+        f"v_{LAMBDA_MAP[leg]}",
+        f"$(1.0-v_{LAMBDA_MAP[leg]})",
+    )
+
+    lam_dir = f"{root}/{leg}/lambda_{lam:.5f}"
+    os.makedirs(lam_dir, exist_ok=True)
+
+    fill_copy["data_outfile"] = f"{leg}_{lam:.5f}.data"
+
+    prepare_simulation(
+        template=get_template(cfg, leg),
+        template_fill=fill_copy,
+        directory=lam_dir,
+        input_datafile=f"{root}/equil/equilibrated.data",
+        stylefile=f'{cp.get("ff_path")}/ti_styles.lmp',
+        paramsfile=f'{cp.get("ff_path")}/ti_params.lmp',
+    )
+
+def run_ti_leg_queue(
+    cfg, cp, leg, root, lmp_exe, flags, scheduler, template_fill, dry_run=False, batch_size=4,
+):
+    queue = cp.get("ti_queues").get(leg)
+
+    while queue["lams_to_run"]:
+        # Select only a limited number of pending lambdas.
+        batch = list(queue["lams_to_run"])
+
+        # Prepare the jobs for this batch.
+        for lam in batch:
+            prepare_ti_lambda(cfg, cp, leg, lam, root, template_fill)
+
+        # Submit the batch using your existing submission function.
+        calc_ids = run_ti_leg(
+            cfg, leg, batch, root, lmp_exe, flags, scheduler,
+            dry_run=dry_run,
+        )
+
+        # Record submitted work in the restart file.
+        queue["lams_to_run"] = queue["lams_to_run"][len(batch):]
+        queue["running_lams"].extend(batch)
+        cp.write()
+
+        # Wait for this batch to finish before submitting another.
+        wait_for(scheduler, calc_ids, dry_run=dry_run)
+
+        # Only mark completion after successful job completion.
+        queue["completed_lams"].extend(batch)
+        queue["running_lams"] = queue["running_lams"][len(batch):]
+        cp.write()
+
 # ----------------------------------------------------------------------
 # Main workflow
 # ----------------------------------------------------------------------
@@ -267,193 +335,284 @@ def main(config_path, root=".", dry_run=True):
     
     # ---------------- Read config ----------------
     cfg = load_config(config_path)
-    sysp = cfg["system_params"]
-    lmp_exe = cfg["executables"]["lammps"]
-    scheduler = Scheduler(**cfg["scheduler"])
+    sysp = cfg.get("system_params")
+    if sysp is None:
+        raise ValueError('Configuration missing `system_params`')
+    executables = cfg.get("executables")
+    if executables is None:
+        raise ValueError('Configuration missing `executables`')
+    lmp_exe = executables.get("lammps")
+    if lmp_exe is None:
+        raise ValueError('Executables missing `lammps`')
+    scheduler = cfg.get("scheduler")
+    if scheduler is None:
+        raise ValueError('Configuration missing `scheduler`')
+    scheduler = Scheduler(**scheduler)
 
-    os.makedirs(f"{root}/pack", exist_ok=True)
-    os.makedirs(f"{root}/ForceField", exist_ok=True)
+    # ---------------- Read Restart File ----------
+    cp_file = cfg.get("restart_file", "restart.json")
+    if cp_file[-len('.json'):] != '.json':
+        print(cp_file)
+        raise ValueError('Restart file must end in .json')
+    cp = Checkpointer(path=cp_file)
+    
+    progress_flag = cp.get("progress_flag", "init")
+    cp.update('progress_flag', progress_flag)
+    root = cp.get('root', root)
+    cp.update('root', root)
+
+    # Make directories for prepared system & forcefield
+    system_path = cp.get("system_path", f"{root}/prepared")
+    os.makedirs(system_path, exist_ok=True)
+    cp.update('system_path', os.path.realpath(system_path))
+
+    ff_path = cp.get("ff_path", f"{root}/ForceField")
+    os.makedirs(ff_path, exist_ok=True)
+    cp.update('ff_path', os.path.realpath(ff_path))
 
     # ---------------- Build system ----------------
-    if sysp["system_mode"] == "pack":
+    system_mode = sysp.get("system_mode")
+    if system_mode not in ("pack","prepared"):
+        raise ValueError(f"Incorrect `system_mode`, expects pack/prepared, got {system_mode}")
+    cp.update('system_mode', system_mode)
+
+    # Need atom_style either way
+    if cp.get("progress_flag") == 'init':
+        atom_style = cfg.get("sim_params", {}).get("atom_style")
+        if atom_style is None:
+            raise ValueError("sim_params missing `atom_style`")
+        style_file = sysp.get("style_file")
+        if style_file is None:
+            raise ValueError("system_params missing `style_file`")
+        param_file = sysp.get("param_file")
+        if param_file is None:
+            raise ValueError("system_params missing `param_file`")
+
+        if system_mode == "pack":
+
+            # Check packmol requirements
+            L = sysp.get("pack_boxlen")
+            if L is None:
+                raise ValueError("system_params missing `pack_boxlen`")
+            pack_tol = sysp.get("pack_tol")
+            if pack_tol is None:
+                raise ValueError("system_param missing `pack_tol`")
+            packmol_exe = cfg.get("executables", {}).get("packmol")
+            if packmol_exe is None:
+                raise ValueError("executables missing `packmol`")
+
+            # Solute first (molecule 1), then solvent(s)
+            solute = sysp.get("solute")
+            if solute is None:
+                raise ValueError("system_params missing `solute`")
+            sol_struct = solute.get("structure")
+            if sol_struct is None:
+                raise ValueError("solute in system_params missing `structure`")
+            passed = [{"structure": sol_struct, "number": 1}]
+            solvent = sysp.get("solvent")
+            if solvent is None:
+                raise ValueError("system_params missing `solvent`")
+            passed += solvent
+
+            molecules = []
+            for mol in passed:
+                struct = mol.get("structure")
+                num = mol.get("number")
+                if struct is None or num is None:
+                    raise ValueError("`structure` or `number` missing from molecule entry")
+
+                molecules.append({
+                    "data": LammpsData(struct, atom_style),
+                    "number": num,
+                })
+
+            # ---------------- Read forcefield ----------------
+            ff = Forcefield(
+                style_file=style_file, 
+                param_file=param_file,
+                data_files=[m["data"] for m in molecules],
+                atom_style=atom_style
+            )
+
+            # Reduce forcefield, using all types in all datafiles
+            mapping = ff.reduce_forcefield([m["data"] for m in molecules], atom_style)
+            for mol in molecules:
+                mol["data"].apply_reduced_mapping(mapping)
+
+            system = LammpsData.pack(
+                molecules=molecules,
+                box=(0, L, 0, L, 0, L),
+                packmol_exe=packmol_exe,
+                pack_dir=system_path,
+                tolerance=pack_tol,  # adjust to your pack() signature
+            )
+
+            sol_group = 'molecule 1'
+            cp.update('group_cmd', sol_group)
         
-        # Solute first (molecule 1), then solvent(s)
-        passed = [{"structure": sysp["solute"]["structure"], "number": 1}]
-        passed += sysp["solvent"]
+        elif system_mode == "prepared":
+            
+            # Read the already packed system & reduce the forcefield
+            data_file = sysp.get("data_file")
+            if data_file is None:
+                raise ValueError("system_params missing `data_file`")
+            system = LammpsData(data_file, atom_style)
+            
+            # ---------------- Read forcefield ----------------
+            ff = Forcefield(
+                style_file=style_file, 
+                param_file=param_file,
+                data_files=[system],
+                atom_style=atom_style
+            )
+            mapping = ff.reduce_forcefield([system], atom_style)
+            system.apply_reduced_mapping(mapping)
+            sol_group = cfg.get('system_params', {}).get('group_cmd')
+            if sol_group is None:
+                raise ValueError("system_params missing `group_cmd`")
+            cp.update('group_cmd', sol_group)
+        
+        # Make sure group_cmd is legal & parse correct attribute
+        sol_group = cp.get('group_cmd')
+        attr, target = parse_group_cmd(sol_group)
 
-        molecules = []
-        for mol in passed:
-            molecules.append({
-                "data": LammpsData(mol["structure"], cfg["sim_params"]["atom_style"]),
-                "number": mol["number"],
-            })
+        # Make sure solute is unique
+        unique_attr_map = system.make_attr_unique(attr=attr, target_value=target)
+        system.write_data(f"{cp.get("system_path")}/packed.data")
 
-        # ---------------- Read forcefield ----------------
-        ff = Forcefield(
-            style_file=sysp["style_file"], 
-            param_file=sysp["param_file"],
-            data_files=[m["data"] for m in molecules],
-            atom_style=cfg["sim_params"]["atom_style"]
+        # For any new types required to make solute unique, clone relevant parameters
+        ff.clone_types(unique_attr_map, style_types=["pair"])
+
+        # Save original parameters before adding bubble/scaling
+        ff.write_parameter_file(f"{cp.get("ff_path")}/params.lmp")
+        ff.write_style_file(f"{cp.get("ff_path")}/styles.lmp")
+
+        # ---------------- Modify forcefield for TI ----------------
+        sol_types = find_solute_types(system, attr, target)
+        duplicated_styles = duplicate_cross_pairstyles(
+            ff, sol_types, scale_factor="v_lambda_cross"
         )
 
-        # Reduce forcefield, using all types in all datafiles
-        mapping = ff.reduce_forcefield([m["data"] for m in molecules], cfg["sim_params"]["atom_style"])
-        for mol in molecules:
-            mol["data"].apply_reduced_mapping(mapping)
-
-        L = sysp["pack_boxlen"]
-        system = LammpsData.pack(
-            molecules=molecules,
-            box=(0, L, 0, L, 0, L),
-            packmol_exe=cfg["executables"]["packmol"],
-            pack_dir=f"{root}/pack",
-            tolerance=sysp["pack_tol"],  # adjust to your pack() signature
+        bubble_pot = cfg.get("ti_params").get("bubble_potential")
+        if bubble_pot is None:
+            raise ValueError("ti_params missing `bubble_potential`")
+        bubble_args = cfg.get("ti_params").get("bubble_param_args")
+        if bubble_args is None:
+            raise ValueError("ti_params missing `bubble_param_args`")
+        add_bubble_potential(
+            ff, sol_types, bubble_pot, bubble_args, scale_factor="v_lambda_bubble"
         )
-
-        sol_group = 'molecule 1'
-    else:
         
-        # Read the already packed system & reduce the forcefield
-        system = LammpsData(sysp.get("data_file"), cfg["sim_params"]["atom_style"])
-        # ---------------- Read forcefield ----------------
-        ff = Forcefield(
-            style_file=sysp["style_file"], 
-            param_file=sysp["param_file"],
-            data_files=[system],
-            atom_style=cfg["sim_params"]["atom_style"]
-        )
-        mapping = ff.reduce_forcefield([system], cfg["sim_params"]["atom_style"])
-        system.apply_reduced_mapping(mapping)
-        sol_group = cfg['system_params']['group_cmd']
-        
-    # Move group_cmd to sim_params
-    cfg['sim_params']['group_cmd'] = sol_group
-    attr, target = parse_group_cmd(sol_group)
+        ff.write_parameter_file(f"{cp.get("ff_path")}/ti_params.lmp")
+        ff.write_style_file(f"{cp.get("ff_path")}/ti_styles.lmp")
 
-    # Make sure solute is unique
-    unique_attr_map = system.make_attr_unique(attr=attr, target_value=target)
-    system.write_data(f"{root}/pack/packed.data")
-
-    # For any new types required to make solute unique, clone relevant parameters
-    ff.clone_types(unique_attr_map, style_types=["pair"])
-
-    # Save original parameters before adding bubble/scaling
-    ff.write_parameter_file(f"{root}/ForceField/params.lmp")
-    ff.write_style_file(f"{root}/ForceField/styles.lmp")
-
-    # ---------------- Modify forcefield for TI ----------------
-    sol_types = find_solute_types(system, attr, target)
-    duplicated_styles = duplicate_cross_pairstyles(
-        ff, sol_types, scale_factor="v_lambda_cross"
-    )
-
-    bubble_pot = cfg.get("ti_params").get("bubble_potential")
-    bubble_args = cfg.get("ti_params").get("bubble_param_args")
-    add_bubble_potential(
-        ff, sol_types, bubble_pot, bubble_args, scale_factor="v_lambda_bubble"
-    )
-    
-    ff.write_parameter_file(f"{root}/ForceField/ti_params.lmp")
-    ff.write_style_file(f"{root}/ForceField/ti_styles.lmp")
+        flags = get_accelerator_flags(cfg, ff)
+        cp.update('acc_flags', cp.get("flags"))
+        cp.update('progress_flag', 'init_done')
 
     # ---------------- Charge scaling needed? ----------------
-    has_kspace = parse_kspace_style(cfg["input_templates"]["equil"])
+    equil_template = cfg.get("input_templates", {}).get("equil")
+    if equil_template is None:
+        raise ValueError("input_templates missing `equil`")
+    has_kspace = parse_kspace_style(equil_template)
     if has_kspace:
         raise ValueError("This pipeline should not be used with a kspace solver.")
     legs = ["bubble_on", "bubble_off", "ti_cross"]
 
     # ---------------- Template fill values ----------------
+    cfg['sim_params']['group_cmd'] = cp.get('group_cmd')
     template_fill = dict(cfg["sim_params"])
     template_fill["random_seed"] = (
         random.randint(1, 10**6) if cfg.get("random_seed_use") else 3454
     )
-    template_fill["equil_frac"] = cfg["ti_params"]["equil_frac"]
-
-    flags = get_accelerator_flags(cfg, ff)
     
-    if sysp["system_mode"] == "pack":
-        # ---------------- Minimization ----------------
-        prepare_simulation(
-            template=cfg["input_templates"]["min"],
-            template_fill=template_fill,
-            directory=f"{root}/min",
-            input_datafile=f"{root}/pack/packed.data",
-            stylefile=f"{root}/ForceField/styles.lmp",
-            paramsfile=f"{root}/ForceField/params.lmp",
-        )
-        run_stage(cfg, "min", f"{root}/min", lmp_exe, flags, scheduler, dry_run=dry_run)
-        min_datafile = f"{root}/min/minimized.data"
-    else:
-        min_datafile = f"{root}/pack/packed.data"
+    if cp.get("progress_flag") == "init_done":
+        if cp.get("system_mode") == "pack":
+            # ---------------- Minimization ----------------
+            min_template = cfg.get("input_templates", {}).get("min")
+            if min_template is None:
+                raise ValueError("input_templates missing `min`")
 
-    # ---------------- Equilibration ----------------
-    prepare_simulation(
-        template=cfg["input_templates"]["equil"],
-        template_fill=template_fill,
-        directory=f"{root}/equil",
-        input_datafile=min_datafile,
-        stylefile=f"{root}/ForceField/styles.lmp",
-        paramsfile=f"{root}/ForceField/params.lmp",
-    )
-    run_stage(cfg, "equil", f"{root}/equil", lmp_exe, flags, scheduler, dry_run=dry_run)
+            prepare_simulation(
+                template=min_template,
+                template_fill=template_fill,
+                directory=f"{root}/min",
+                input_datafile=f"{cp.get("system_path")}/packed.data",
+                stylefile=f"{cp.get("ff_path")}/styles.lmp",
+                paramsfile=f"{cp.get("ff_path")}/params.lmp",
+            )
+            run_stage(cfg, "min", f"{root}/min", lmp_exe, cp.get("flags"), scheduler, dry_run=dry_run)
+            min_datafile = f"{root}/min/minimized.data"
+            cp.update("progress_flag", "min_done")
+        else:
+            min_datafile = f"{cp.get("system_path")}/packed.data"
+            cp.update("progress_flag", "min_done")
+
+    if cp.get("progress_flag") == "min_done":
+        # ---------------- Equilibration ----------------
+        prepare_simulation(
+            template=cfg["input_templates"]["equil"],
+            template_fill=template_fill,
+            directory=f"{root}/equil",
+            input_datafile=min_datafile,
+            stylefile=f"{cp.get("ff_path")}/styles.lmp",
+            paramsfile=f"{cp.get("ff_path")}/params.lmp",
+        )
+        run_stage(cfg, "equil", f"{root}/equil", lmp_exe, cp.get("flags"), scheduler, dry_run=dry_run)
+        cp.update("progress_flag", "equil_done")
 
     # ---------------- Setup TI jobs (no running yet) ----------------
-    # lambda_values = number of intervals
-    lams = cfg["ti_params"]["lambda_values"]
-    if isinstance(lams, int):
-        lams = [float(x) for x in np.linspace(0.0, 1.0, lams)]
-    elif not isinstance(lams, list):
-        raise ValueError(f"lambda_values should be type list or int, got {lams}")
-
-    for leg in legs:
-        fill_copy = template_fill.copy()
-
-        if leg == "bubble_on":
-            fill_copy["lambda_cross"] = 0.0
-        elif leg == "ti_cross":
-            fill_copy["lambda_bubble"] = 1.0
-        elif leg == "bubble_off":
-            fill_copy["lambda_cross"] = 1.0
-        else:
-            raise ValueError(f"Unknown LEG: {leg}")
+    if cp.get("progress_flag") == "equil_done":
+        lams = cfg.get("ti_params",{}).get("lambda_values")
+        if lams is None:
+            raise ValueError("ti_params missing `lambda_values`")
+        if isinstance(lams, int):
+            lams = [float(x) for x in np.linspace(0.0, 1.0, lams)]
+        elif not isinstance(lams, list):
+            raise ValueError(f"lambda_values should be type list or int, got {lams}, type {type(lams)}")
         
-        fill_copy["dUdL_computation_block"] = build_compute_dUdL_lines(
-            f"{root}/ForceField/ti_styles.lmp", f"v_{LAMBDA_MAP[leg]}",
-            f"$(1.0-v_{LAMBDA_MAP[leg]})"
+        # Initialize ti_queues
+        cp.update("ti_queues", {})
+        for leg in legs:
+            cp.data['ti_queues'][leg] = {}
+            cp.data['ti_queues'][leg]["lams_to_run"] = [round(lam, 5) for lam in lams]
+            cp.data['ti_queues'][leg]["running_lams"] = []
+            cp.data['ti_queues'][leg]["completed_lams"] = []
+        cp.write()
+        cp.update("progress_flag", "ti_init_done")
+    
+    if cp.get("progress_flag") == "ti_init_done":
+        # Stage 1: Bubble on
+        run_ti_leg_queue(
+            cfg, cp, "bubble_on", root, lmp_exe,
+            cp.get("flags"), scheduler,
+            template_fill,
+            dry_run=dry_run,
         )
+        cp.update("progress_flag", "bubble_on_done")
 
-        for lam in lams:
-            fill_copy[LAMBDA_MAP[leg]] = lam
+    # Stage 2: Intermediate transformations
+    if cp.get("progress_flag") == "bubble_on_done":
+        for leg in legs:
+            if leg not in ("bubble_on", "bubble_off"):
+                run_ti_leg_queue(
+                    cfg, cp, leg, root, lmp_exe,
+                    cp.get("flags"), scheduler,
+                    template_fill,
+                    dry_run=dry_run,
+                )
+        cp.update("progress_flag", "vdw_done")
 
-            lam_dir = f"{root}/{leg}/lambda_{lam:.5f}"
-            os.makedirs(lam_dir, exist_ok=True)
-
-            fill_copy["data_outfile"] = f"{leg}_{lam:.5f}.data"
-            prepare_simulation(
-                template=get_template(cfg, leg),
-                template_fill=fill_copy,
-                directory=lam_dir,
-                input_datafile=f"{root}/equil/equilibrated.data",
-                stylefile=f"{root}/ForceField/ti_styles.lmp",
-                paramsfile=f"{root}/ForceField/ti_params.lmp",
-            )
-
-    # ---------------- Run simulations ----------------
-    # Bubble on first
-    calc_ids = run_ti_leg(cfg, "bubble_on", lams, root, lmp_exe, flags, scheduler, dry_run=dry_run)
-    wait_for(scheduler, calc_ids, dry_run=dry_run)
-
-    # Then any other transformations, concurrently
-    calc_ids = []
-    for leg in legs:
-        if leg not in ("bubble_on", "bubble_off"):
-            calc_ids.extend(run_ti_leg(cfg, leg, lams, root, lmp_exe, flags, scheduler, dry_run=dry_run))
-    wait_for(scheduler, calc_ids, dry_run=dry_run)
-
-    # Finally, turn the bubble back off
-    calc_ids = run_ti_leg(cfg, "bubble_off", lams, root, lmp_exe, flags, scheduler, dry_run=dry_run)
-    wait_for(scheduler, calc_ids, dry_run=dry_run)
-
+    # Stage 3: Bubble off
+    if cp.get("progress_flag") == "vdw_done":
+        run_ti_leg_queue(
+            cfg, cp, "bubble_off", root, lmp_exe,
+            cp.get("flags"), scheduler,
+            template_fill,
+            dry_run=dry_run,
+        )
+        cp.update("progress_flag", "bubble_off_done")
+        cp.write()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
